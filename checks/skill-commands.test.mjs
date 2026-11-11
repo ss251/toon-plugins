@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { platform, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
-import { checkRepo, lowestVersion, namedCommands } from './skill-commands.mjs';
+import { checkRepo, helpFromSpawn, lowestVersion, namedCommands } from './skill-commands.mjs';
 
 /** A repository holding `files` (path → text), as a directory. */
 function repo(files) {
@@ -106,4 +107,44 @@ test('a toon-client skill naming an unknown toon-client command, or a bare toon 
   assert.equal(problems.length, 2);
   assert.match(problems.join('\n'), /`toon-client frobnicate` is not a command of toon-client 5\.0\.0/);
   assert.match(problems.join('\n'), /names `toon send`, but only toon-cli skills may name `toon` commands/);
+});
+
+test('a Linux toon binary this host cannot execute is a skip, not a throw', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skill-commands-elf-'));
+  const command = join(root, 'toon');
+  // ELF magic is enough: Darwin refuses it with ENOEXEC and does not run it.
+  writeFileSync(command, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]));
+  chmodSync(command, 0o755);
+  const run = spawnSync(command, ['--help'], { encoding: 'utf8' });
+
+  const toon = helpFromSpawn('toon', '0.6.0', command, run);
+  if (platform() !== 'linux' && run.error?.code === 'ENOEXEC') {
+    assert.equal(toon.exitCode, 0);
+    assert.match(toon.skip, /skip: not executing toon@0\.6\.0/);
+    assert.match(toon.skip, /were not checked here/);
+    assert.match(toon.skip, /Ubuntu CI still runs them/);
+  } else {
+    assert.equal(toon.skip, null);
+    assert.notEqual(toon.exitCode, 0);
+  }
+
+  // Another binary's ENOEXEC is a failed run. Skipping it would hide a broken install.
+  const other = helpFromSpawn('toon-client', '5.0.0', command, run);
+  assert.equal(other.skip, null);
+  if (run.error) {
+    assert.notEqual(other.exitCode, 0);
+    assert.match(other.stderr, /could not execute/);
+  }
+});
+
+test('a binary this host can run keeps the exit code of --help', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skill-commands-sh-'));
+  const command = join(root, 'toon-client');
+  writeFileSync(command, '#!/bin/sh\necho "error: unrecognized subcommand" >&2\nexit 2\n');
+  chmodSync(command, 0o755);
+  const run = spawnSync(command, ['frobnicate', '--help'], { encoding: 'utf8' });
+  const outcome = helpFromSpawn('toon-client', '5.0.0', command, run);
+  assert.equal(outcome.skip, null);
+  assert.equal(outcome.exitCode, 2);
+  assert.match(outcome.stderr, /unrecognized subcommand/);
 });

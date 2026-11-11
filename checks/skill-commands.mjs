@@ -6,12 +6,15 @@
 // Run from the repository root: `node checks/skill-commands.mjs`. It fetches each client
 // at the low end of the range its sending skill's frontmatter states (toon from the
 // toon_cli release, toon-client from npm) and runs `--help` on every command the skills
-// name. It needs network access, curl, tar and npm.
+// name. It needs network access, curl, tar and npm. The published `toon` binary is a Linux
+// executable. On another OS the check still verifies that archive, skips only executing it,
+// prints why, and still checks `toon-client`. The skip is not a pass of the `toon` commands.
+// Ubuntu CI still runs them.
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
-import { arch, tmpdir } from 'node:os';
+import { arch, platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -165,10 +168,44 @@ function skillFiles(root, plugin) {
     .sort();
 }
 
+/**
+ * The outcome of one `<binary> <path...> --help`. A published Linux `toon` release that
+ * this host cannot execute is a skip: the commands were not checked, and that is not
+ * evidence they are missing. A skip is not a pass. Any other spawn error is a failed run,
+ * which the caller reports as a problem line instead of an uncaught throw.
+ *
+ * @param {string} binary
+ * @param {string} version
+ * @param {string} command absolute path of the installed binary
+ * @param {import('node:child_process').SpawnSyncReturns<string>} run
+ * @returns {{ exitCode: number, stderr: string, skip: string | null }}
+ */
+export function helpFromSpawn(binary, version, command, run) {
+  if (!run.error) return { exitCode: run.status ?? 1, stderr: run.stderr ?? '', skip: null };
+  const code = typeof run.error.code === 'string' ? run.error.code : 'UNKNOWN';
+  if (binary === 'toon' && code === 'ENOEXEC' && platform() !== 'linux') {
+    return {
+      exitCode: 0,
+      stderr: '',
+      skip:
+        `skip: not executing ${binary}@${version}. The published ${binary} release is a Linux ` +
+        `executable and this host is ${platform()} ${arch()} (${code}), so the ${binary} commands ` +
+        `the skills name were not checked here. Ubuntu CI still runs them.`,
+    };
+  }
+  return {
+    exitCode: 127,
+    stderr: `could not execute \`${command}\`: ${code}: ${run.error.message}`,
+    skip: null,
+  };
+}
+
 /** Installs each client version once, into a temporary directory, and runs it there. */
 function realBinaries() {
   /** @type {Map<string, string>} */
   const installed = new Map();
+  /** @type {Set<string>} binaries whose `--help` this host cannot execute */
+  const skipped = new Set();
   /** @type {(binary: string, version: string) => string} */
   const install = (binary, version) => {
     const dir = mkdtempSync(join(tmpdir(), `${binary}-${version}-`));
@@ -193,8 +230,9 @@ function realBinaries() {
     throw new Error(`No way to install ${binary}.`);
   };
   /** @type {RunHelp} */
-  return async (binary, version, path) => {
+  const runHelp = async (binary, version, path) => {
     const key = `${binary}@${version}`;
+    if (skipped.has(key)) return { exitCode: 0, stderr: '' };
     let command = installed.get(key);
     if (command === undefined) {
       console.error(`Installing ${key}...`);
@@ -202,17 +240,28 @@ function realBinaries() {
       installed.set(key, command);
     }
     const run = spawnSync(command, [...path, '--help'], { encoding: 'utf8' });
-    if (run.error) throw run.error;
-    return { exitCode: run.status ?? 1, stderr: run.stderr };
+    const outcome = helpFromSpawn(binary, version, command, run);
+    if (outcome.skip !== null) {
+      skipped.add(key);
+      console.error(outcome.skip);
+      return { exitCode: 0, stderr: '' };
+    }
+    return { exitCode: outcome.exitCode, stderr: outcome.stderr };
   };
+  return { runHelp, skipped };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const problems = await checkRepo(process.cwd(), realBinaries());
+  const binaries = realBinaries();
+  const problems = await checkRepo(process.cwd(), binaries.runHelp);
   for (const problem of problems) console.error(problem);
   if (problems.length > 0) {
     console.error(`\n${problems.length} command(s) in the skills fail the check.`);
     process.exit(1);
   }
-  console.error('Every command the skills name exists in its client\'s lowest supported version.');
+  console.error(
+    binaries.skipped.size > 0
+      ? 'Every command this host could run exists in its client\'s lowest supported version.'
+      : 'Every command the skills name exists in its client\'s lowest supported version.',
+  );
 }
